@@ -1,0 +1,6 @@
+numpy>=1.24.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+pyserial>=3.5
+pygame>=2.5.0
+PyLidar3>=0.1.2

@@ -1,0 +1,8 @@
+curl http://10.224.13.53/js?json=%7B%22T%22:126%7D
+(fetch IMU data)
+
+(Terminal 1)
+ros2 run joy joy_node --ros-args -p deadzone:=0.05
+
+(Terminal 2)
+python3 joy_rover_http.py

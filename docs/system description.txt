@@ -1,0 +1,94 @@
+PROJECT: "without_pi" Autonomous Rover — now being rebuilt as a Pi-based system
+(name is legacy; originally ran all compute on a host PC instead of an SBC,
+currently migrating to Raspberry Pi 5 as the compute unit)
+
+HARDWARE:
+- Base: Waveshare 4WD Mobile Rover, differential drive, ESP32 driver board
+  (Waveshare "General Driver for Robots" / WAVE ROVER-class board)
+- Compute: Raspberry Pi 5 (replacing a Windows/Linux host PC used in the
+  original prototype), running Raspberry Pi OS 64-bit
+- LiDAR: 2D YDLiDAR G4, connected via USB to the Pi 5 (previously used
+  PyLidar3 on the host PC; G4 support in PyLidar3 was unreliable — planning
+  to switch to YDLiDAR's official SDK or the `lds2d` package instead)
+- Rover link: ESP32 connected to the Pi 5 via the 40-pin UART header
+  (switched from WiFi/HTTP JSON control to wired UART for reliability;
+  same JSON command protocol over both transports, e.g.
+  {"T":1,"L":<left>,"R":<right>} for motors, {"T":126} for IMU data,
+  115200 baud via pyserial)
+- Planned addition: ultrasonic sensors wired to the ESP32 directly (not the
+  Pi) so emergency obstacle stops happen on a fast local path, independent
+  of the Pi's control loop latency
+- IMU: 9-axis onboard the ESP32, polled/streamed over the same UART link.
+  IMU and all rover-side hardware (motors, ESP32 firmware, IMU signal
+  quality) are considered TRUSTED/WORKING — not under investigation.
+
+SOFTWARE ARCHITECTURE (pure Python, no ROS — this is a deliberate design
+choice central to the project's framing, not a gap to fill):
+- config.py — central config: MAP_RES_M=0.05m, MAP_SIZE_M=20m,
+  ICP_MAX_ITER=30, ICP_MAX_DIST=0.30m, IMU_ALPHA=0.7 (ICP trust weight,
+  0.3 = IMU trust weight) in a complementary filter, MAX_LINEAR_SPEED=
+  0.45m/s, MAX_ANGULAR_SPEED=1.5rad/s, WHEEL_BASE_M=0.17m,
+  OBSTACLE_WARN_M=0.30m, OBSTACLE_CRIT_M=0.12m, STUCK_TIMEOUT_S=6.0s
+- slam.py — frame-to-frame ICP odometry (scipy.spatial.KDTree-accelerated),
+  2D occupancy grid mapping, IMU/ICP complementary filter fusion,
+  multi-sector proximity alerts, live Matplotlib dashboard
+- nav.py — 8-connected A* planner with obstacle inflation
+  (INFLATION_RADIUS_M=0.10m), RotateAndDrive/PurePursuit controllers,
+  previously included a "PreconnectPool" of persistent TCP sockets to
+  defeat WiFi HTTP handshake latency — now less relevant since motor
+  control moved to wired UART (no handshake cost there)
+- hybrid.py — main runtime: manual teleop (gamepad/keyboard) + click-to-
+  navigate on the live map, threaded SLAM/nav/motor-dispatch architecture,
+  stuck detection + spin-escape recovery, save/resume via .npz
+- auto.py — FrontierDetector for autonomous frontier-based exploration
+  of unmapped areas
+
+CURRENT CORE BUG BEING FIXED (the main reason for this rebuild):
+Mapping a real square room, the occupancy grid starts correct (square)
+but deforms as the robot is driven manually, ending up looking almost
+circular — actually diagnosed from a screenshot as TWO overlapping
+rotated square outlines (not smooth circular drift) PLUS a separate
+radial "starburst" of spike artifacts around the map perimeter.
+Two distinct root causes identified:
+  (A) Discrete heading "snap" — likely ICP converging to a wrong local
+      minimum on specific frames (symmetric/rectangular rooms are
+      prone to this), no outlier rejection currently exists on ICP
+      output before it's accepted into the fused pose / map.
+  (B) Unfiltered bad LiDAR returns (0/NaN/max-range garbage, likely
+      exacerbated by weak PyLidar3 G4 support / corrupted serial
+      packets with no checksum validation) being raycast as long
+      spikes into the occupancy grid.
+
+PLANNED FIXES (in progress):
+- Switch scan-to-scan ICP to scan-to-map ICP (match against accumulated
+  map/local submap instead of the previous single frame) — primary fix
+  for issue (A), inspired by how slam_toolbox (ROS2) approaches this,
+  but implemented independently in the existing pure-Python stack
+  (explicitly NOT migrating to ROS2 — that would erase the project's
+  "lean, custom, non-ROS, low-latency" framing, which is also the
+  intended research contribution for an eventual conference paper)
+- Add ICP outlier rejection: reject/down-weight any single-frame update
+  with implausible delta-heading or high fit residual
+- Add range-validity + neighbor-outlier spike filtering on raw LiDAR
+  scans before they reach ICP or the occupancy grid — fixes issue (B)
+- Re-tune or replace the fixed-weight IMU_ALPHA complementary filter
+  (possibly a simple Kalman filter) now that IMU data arrives over a
+  more reliable wired UART link instead of WiFi
+
+GOAL: After the rebuild, publish a conference paper (not journal —
+scope is appropriately sized for IEEE regional/Springer LNCS-style
+venues, not a top journal) centered on the novel systems contributions:
+(1) the offload/compute-architecture design itself, (2) motor-command
+latency benchmarking (PreconnectPool-era WiFi vs wired UART comparison),
+(3) the scan-to-map ICP + outlier-rejection fix with before/after
+trajectory-drift measurements as the key result, and (4) optionally an
+improved frontier-exploration cost function in auto.py. A separate
+literature-review spreadsheet of related SLAM/offloading/frontier-
+exploration papers (with journal quartile/impact factor data) has
+already been compiled separately.
+
+STATUS: Rebuilding step-by-step, phase-by-phase, each phase gated by
+a concrete pass/fail test before moving to the next. Rover-side hardware
+(motors, ESP32 firmware, IMU) is NOT under test — only Pi 5 + LiDAR
+integration and the SLAM/ICP processing pipeline are being rebuilt and
+validated from scratch.
