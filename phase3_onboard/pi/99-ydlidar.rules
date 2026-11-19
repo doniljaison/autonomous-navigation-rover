@@ -1,0 +1,4 @@
+# YDLIDAR G4 USB adapter board (Silicon Labs CP210x) -> /dev/ydlidar
+# If another CP210x device is ever connected to this Pi, add ATTRS{serial}=="..."
+# (see: udevadm info -a -n /dev/ttyUSB0 | grep serial) to tell them apart.
+KERNEL=="ttyUSB*", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", MODE:="0666", GROUP:="dialout", SYMLINK+="ydlidar"

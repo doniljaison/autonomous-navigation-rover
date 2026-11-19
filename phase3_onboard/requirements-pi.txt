@@ -1,0 +1,7 @@
+# Phase 3 on-board stack (Raspberry Pi 4B, Raspberry Pi OS Lite 64-bit, Python 3.11)
+# The YDLidar-SDK Python binding is built from source by pi/setup_pi4.sh.
+numpy>=1.24
+scipy>=1.10
+numba>=0.59
+pyserial>=3.5
+# PC only (diagnosis plots): matplotlib

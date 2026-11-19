@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rover Console</title>
+<style>
+:root{
+  --bg:#0e1116; --panel:#151a21; --line:#252c36; --fg:#dfe5ee; --mute:#7f8a99;
+  --acc:#35c4e8; --path:#ff5c8a; --ok:#3ddc84; --warn:#ffc53d; --bad:#ff4d4f;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:13px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+#app{display:grid;grid-template-columns:1fr 330px;height:100vh}
+#mapwrap{position:relative;overflow:hidden;background:#808080;touch-action:none}
+canvas{display:block;width:100%;height:100%;cursor:crosshair}
+#hud{position:absolute;left:12px;top:10px;font-family:var(--mono);font-size:12px;background:rgba(14,17,22,.82);
+  padding:6px 10px;border-radius:6px;border:1px solid var(--line);pointer-events:none}
+#hud b{color:var(--acc)}
+#banner{position:absolute;left:50%;top:10px;transform:translateX(-50%);display:none;background:var(--bad);
+  color:#fff;font-weight:700;padding:8px 14px;border-radius:6px;letter-spacing:.04em}
+#zoom{position:absolute;right:12px;bottom:12px;display:flex;gap:6px}
+#side{background:var(--panel);border-left:1px solid var(--line);padding:12px 14px;overflow-y:auto}
+h2{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--mute);margin:16px 0 6px;font-weight:600}
+h2:first-child{margin-top:0}
+.row{display:flex;justify-content:space-between;gap:8px;font-family:var(--mono);font-size:12px;padding:2px 0;border-bottom:1px dashed #1e242d}
+.row span:first-child{color:var(--mute)}
+button{font:inherit;color:var(--fg);background:#1d2430;border:1px solid var(--line);border-radius:6px;padding:7px 10px;cursor:pointer}
+button:hover{border-color:var(--acc)}
+#stop{width:100%;background:var(--bad);border-color:var(--bad);color:#fff;font-weight:800;font-size:16px;padding:12px;letter-spacing:.08em}
+.btns{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:8px}
+.pill{display:inline-block;padding:1px 8px;border-radius:99px;font-weight:700;font-size:11px}
+.MANUAL{background:#203a2a;color:var(--ok)} .AUTO{background:#173847;color:var(--acc)}
+.ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+#notes{font-family:var(--mono);font-size:11px;color:var(--mute);white-space:pre-wrap}
+.help{color:var(--mute);font-size:12px}
+kbd{font-family:var(--mono);background:#232a35;border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:0 5px;font-size:11px;color:var(--fg)}
+#pad{display:none;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px}
+#pad button{padding:14px 0;font-size:16px}
+@media (max-width:760px){
+  #app{grid-template-columns:1fr;grid-template-rows:58vh auto;height:auto}
+  #mapwrap{height:58vh}
+  #side{border-left:0;border-top:1px solid var(--line)}
+  #pad{display:grid}
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="mapwrap">
+    <canvas id="cv"></canvas>
+    <div id="hud">—</div>
+    <div id="banner">SLAM LOST — rover stopped</div>
+    <div id="zoom"><button id="zin">+</button><button id="zout">−</button><button id="zfit">◎</button></div>
+  </div>
+  <div id="side">
+    <button id="stop">STOP (Space)</button>
+    <div class="btns"><button id="save">Save map</button><button id="resume">Resume</button><button id="follow">Follow: on</button></div>
+    <div id="pad">
+      <span></span><button data-k="w">▲</button><span></span>
+      <button data-k="a">◀</button><button data-k="s">▼</button><button data-k="d">▶</button>
+    </div>
+
+    <h2>Mode</h2>
+    <div class="row"><span>mode</span><span><span id="mode" class="pill MANUAL">MANUAL</span> <span id="phase"></span></span></div>
+    <div class="row"><span>pose x, y, θ</span><span id="pose">—</span></div>
+    <div class="row"><span>goal</span><span id="goal">—</span></div>
+
+    <h2>SLAM gate</h2>
+    <div class="row"><span>rate / accepted</span><span id="slamrate">—</span></div>
+    <div class="row"><span>reject rate (30)</span><span id="rej">—</span></div>
+    <div class="row"><span>last</span><span id="last">—</span></div>
+    <div class="row"><span>inliers / rms</span><span id="inl">—</span></div>
+    <div class="row"><span>gyro vs match Δθ</span><span id="dth">—</span></div>
+    <div class="row"><span>step ms (match)</span><span id="ms">—</span></div>
+    <div class="row"><span>gyro bias</span><span id="gb">—</span></div>
+
+    <h2>Sensors &amp; link</h2>
+    <div class="row"><span>LiDAR</span><span id="lid">—</span></div>
+    <div class="row"><span>link</span><span id="link">—</span></div>
+    <div class="row"><span>cmd L / R</span><span id="cmd">—</span></div>
+    <div class="row"><span>front / rear</span><span id="prox">—</span></div>
+
+    <h2>Pi 4B</h2>
+    <div class="row"><span>CPU / temp</span><span id="sys">—</span></div>
+    <div class="row"><span>throttled</span><span id="thr">—</span></div>
+
+    <h2>Events</h2>
+    <div id="notes"></div>
+
+    <h2>Controls</h2>
+    <div class="help">
+      <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> / arrows drive · gamepad: hold <kbd>LB</kbd>, triggers + left stick<br>
+      click map = goal · drag = pan · wheel = zoom<br>
+      <kbd>Space</kbd> stop · <kbd>M</kbd> save map<br>
+      Closing this tab or losing WiFi stops the rover within 0.4 s.
+    </div>
+  </div>
+</div>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const cv = $("cv"), ctx = cv.getContext("2d");
+let S = null, mapImg = null, mapVer = -1, mapMeta = null;
+let view = {cx: 0, cy: 0, scale: 60};   // world centre (m), px per m
+let follow = true;
+
+function post(url, body) {
+  return fetch(url, {method: "POST", headers: {"Content-Type": "application/json"},
+                     body: JSON.stringify(body || {})}).then(r => r.json()).catch(() => null);
+}
+
+// ── rendering ────────────────────────────────────────────────────────────────
+function resize() {
+  const r = cv.getBoundingClientRect(), d = window.devicePixelRatio || 1;
+  cv.width = Math.round(r.width * d); cv.height = Math.round(r.height * d);
+  ctx.setTransform(d, 0, 0, d, 0, 0);
+}
+window.addEventListener("resize", resize);
+function w2s(x, y) {
+  const r = cv.getBoundingClientRect();
+  return [r.width / 2 + (x - view.cx) * view.scale, r.height / 2 - (y - view.cy) * view.scale];
+}
+function s2w(px, py) {
+  const r = cv.getBoundingClientRect();
+  return [view.cx + (px - r.width / 2) / view.scale, view.cy - (py - r.height / 2) / view.scale];
+}
+function draw() {
+  const r = cv.getBoundingClientRect();
+  ctx.fillStyle = "#808080"; ctx.fillRect(0, 0, r.width, r.height);
+  if (S && follow) { view.cx = S.pose[0]; view.cy = S.pose[1]; }
+  if (mapImg && mapMeta) {
+    const m = mapMeta, half = m.res / 2;
+    const [x0, y0] = w2s(-m.orig * m.res - half, (m.n - 1 - m.orig) * m.res + half);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(mapImg, x0, y0, m.n * m.res * view.scale, m.n * m.res * view.scale);
+  }
+  // 1 m grid
+  ctx.strokeStyle = "rgba(53,196,232,.10)"; ctx.lineWidth = 1;
+  const [wl, wt] = s2w(0, 0), [wr, wb] = s2w(r.width, r.height);
+  for (let x = Math.ceil(wl); x <= wr; x++) { const [sx] = w2s(x, 0); ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, r.height); ctx.stroke(); }
+  for (let y = Math.ceil(wb); y <= wt; y++) { const [, sy] = w2s(0, y); ctx.beginPath(); ctx.moveTo(0, sy); ctx.lineTo(r.width, sy); ctx.stroke(); }
+  if (!S) return;
+  // trail
+  ctx.strokeStyle = "#ff5c8a"; ctx.lineWidth = 2; ctx.beginPath();
+  S.trail.forEach((p, i) => { const [sx, sy] = w2s(p[0], p[1]); i ? ctx.lineTo(sx, sy) : ctx.moveTo(sx, sy); });
+  ctx.stroke();
+  // planned path
+  if (S.path.length) {
+    ctx.strokeStyle = "#35c4e8"; ctx.setLineDash([6, 4]); ctx.beginPath();
+    const [px, py] = w2s(S.pose[0], S.pose[1]); ctx.moveTo(px, py);
+    S.path.forEach(p => { const [sx, sy] = w2s(p[0], p[1]); ctx.lineTo(sx, sy); });
+    ctx.stroke(); ctx.setLineDash([]);
+  }
+  // scan
+  ctx.fillStyle = "#ffb000";
+  S.scan.forEach(p => { const [sx, sy] = w2s(p[0], p[1]); ctx.fillRect(sx - 1.5, sy - 1.5, 3, 3); });
+  // goal
+  if (S.goal) {
+    const [gx, gy] = w2s(S.goal[0], S.goal[1]);
+    ctx.strokeStyle = "#ff5c8a"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(gx - 8, gy - 8); ctx.lineTo(gx + 8, gy + 8); ctx.moveTo(gx + 8, gy - 8); ctx.lineTo(gx - 8, gy + 8); ctx.stroke();
+  }
+  // sim truth (ghost)
+  if (S.sim_truth) {
+    const [tx, ty] = w2s(S.sim_truth[0], S.sim_truth[1]);
+    ctx.strokeStyle = "rgba(255,255,255,.7)"; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(tx, ty, 9, 0, 7); ctx.stroke();
+  }
+  // robot
+  const [rx, ry] = w2s(S.pose[0], S.pose[1]), th = S.pose[2];
+  ctx.save(); ctx.translate(rx, ry); ctx.rotate(-th);
+  const L = Math.max(12, 0.26 * view.scale), W = Math.max(9, 0.19 * view.scale);
+  ctx.fillStyle = S.lost ? "#ff4d4f" : "#35c4e8"; ctx.globalAlpha = .9;
+  ctx.fillRect(-L / 2, -W / 2, L, W);
+  ctx.globalAlpha = 1; ctx.fillStyle = "#0e1116";
+  ctx.beginPath(); ctx.moveTo(L / 2, 0); ctx.lineTo(L / 2 - 7, -5); ctx.lineTo(L / 2 - 7, 5); ctx.fill();
+  ctx.restore();
+}
+
+// ── polling ──────────────────────────────────────────────────────────────────
+const f2 = v => v == null ? "—" : (+v).toFixed(2);
+function setText(id, t, cls) { const e = $(id); e.textContent = t; if (cls !== undefined) e.className = cls; }
+async function pollState() {
+  try {
+    const r = await fetch("/api/state"); S = await r.json();
+    mapMeta = S.map;
+    if (S.map.version !== mapVer) loadMap();
+    updatePanel();
+  } catch (e) { setText("hud", "no connection to the Pi"); }
+  setTimeout(pollState, 125);
+}
+let mapLoading = false;
+function loadMap() {
+  if (mapLoading) return; mapLoading = true;
+  const img = new Image();
+  img.onload = () => { mapImg = img; mapLoading = false; };
+  img.onerror = () => { mapLoading = false; };
+  img.src = "/api/map.png?v=" + S.map.version;
+  mapVer = S.map.version;
+}
+function updatePanel() {
+  const p = S.pose, sl = S.slam, last = sl.last || {};
+  $("hud").innerHTML = `<b>${S.mode}</b> x ${f2(p[0])} y ${f2(p[1])} θ ${(p[2] * 180 / Math.PI).toFixed(1)}° · SLAM ${sl.hz} Hz · reject ${(sl.reject_rate * 100).toFixed(0)}%`;
+  $("banner").style.display = S.lost ? "block" : "none";
+  const m = $("mode"); m.textContent = S.mode; m.className = "pill " + S.mode;
+  setText("phase", S.phase);
+  setText("pose", `${f2(p[0])}, ${f2(p[1])}, ${(p[2] * 180 / Math.PI).toFixed(1)}°`);
+  setText("goal", S.goal ? `${f2(S.goal[0])}, ${f2(S.goal[1])}` : "—");
+  setText("slamrate", `${sl.hz} Hz · ${sl.accepted}/${sl.frames}`);
+  setText("rej", (sl.reject_rate * 100).toFixed(0) + " %", sl.reject_rate > .3 ? "bad" : sl.reject_rate > .1 ? "warn" : "ok");
+  setText("last", last.why || "—", (last.acc ? "ok" : "warn"));
+  setText("inl", last.inl != null ? `${last.inl} (${(last.ir * 100).toFixed(0)}%) / ${(last.rms * 100).toFixed(1)} cm` : "—");
+  const d = v => v == null ? "—" : (v * 180 / Math.PI).toFixed(2) + "°";
+  setText("dth", `${d(last.gdth)} / ${d(last.mdth)}`);
+  setText("ms", last.ms ? `${f2(last.ms.total)} (${f2(last.ms.match)})` : "—");
+  setText("gb", (sl.gyro_ready ? "" : "estimating… ") + sl.gyro_bias_dps + "°/s ×" + sl.gyro_scale_corr,
+          sl.gyro_ready && Math.abs(sl.gyro_scale_corr - 1) < 0.1 ? "" : "warn");
+  const li = S.lidar; setText("lid", `${li.rate_hz} Hz · ${li.points} pts · drop ${li.dropped}` + (li.error ? " · ERR" : ""), li.rate_hz > 4 ? "ok" : "bad");
+  const lk = S.link; setText("link", `${lk.transport} rx ${lk.rx_age_s == null ? "—" : lk.rx_age_s + " s"} · wd ${lk.watchdog_trips}`, lk.rx_age_s != null && lk.rx_age_s < 0.5 ? "ok" : "bad");
+  setText("cmd", `${lk.last_cmd[0]} / ${lk.last_cmd[1]} (${lk.intent_src})`);
+  setText("prox", `${f2(S.prox.front)} / ${f2(S.prox.rear)} m`, S.prox.front != null && S.prox.front < .3 ? "warn" : "");
+  const sy = S.sys || {};
+  setText("sys", `${sy.cpu ?? "—"} % · ${sy.temp ?? "—"} °C (max ${sy.max_temp ?? "—"})`, sy.temp > 75 ? "bad" : "");
+  setText("thr", sy.throttled == null ? "n/a" : `${sy.throttled} ${(sy.throttled_flags || []).join(", ")}`, sy.throttled && sy.throttled !== "0x0" ? "bad" : "ok");
+  $("notes").textContent = S.notes.slice().reverse().join("\n");
+}
+function frame() { draw(); requestAnimationFrame(frame); }
+
+// ── input: keyboard, touch pad, gamepad ─────────────────────────────────────
+const keys = new Set();
+let driving = false;
+const KEYMAP = {w: "w", arrowup: "w", s: "s", arrowdown: "s", a: "a", arrowleft: "a", d: "d", arrowright: "d"};
+window.addEventListener("keydown", e => {
+  const k = e.key.toLowerCase();
+  if (k === " ") { e.preventDefault(); keys.clear(); post("/api/stop"); return; }
+  if (k === "m") { post("/api/save"); return; }
+  if (KEYMAP[k]) { e.preventDefault(); keys.add(KEYMAP[k]); }
+});
+window.addEventListener("keyup", e => { const k = KEYMAP[e.key.toLowerCase()]; if (k) keys.delete(k); });
+window.addEventListener("blur", () => keys.clear());
+document.querySelectorAll("#pad button").forEach(b => {
+  const k = b.dataset.k;
+  b.addEventListener("pointerdown", e => { e.preventDefault(); keys.add(k); });
+  ["pointerup", "pointerleave", "pointercancel"].forEach(ev => b.addEventListener(ev, () => keys.delete(k)));
+});
+function gamepadIntent() {
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  for (const gp of pads) {
+    if (!gp || !gp.buttons[4] || !gp.buttons[4].pressed) continue;   // hold LB to drive
+    const thr = (gp.buttons[7] ? gp.buttons[7].value : 0) - (gp.buttons[6] ? gp.buttons[6].value : 0);
+    let turn = -(gp.axes[0] || 0);
+    if (Math.abs(turn) < 0.08) turn = 0;
+    return [thr, turn];
+  }
+  return null;
+}
+setInterval(() => {   // 10 Hz intent stream; the Pi stops the rover if this goes quiet
+  let fwd = 0, turn = 0;
+  if (keys.has("w")) fwd += 1; if (keys.has("s")) fwd -= 1;
+  if (keys.has("a")) turn += 1; if (keys.has("d")) turn -= 1;   // +turn = CCW (left)
+  const g = gamepadIntent(); if (g && (Math.abs(g[0]) > .05 || Math.abs(g[1]) > .05)) [fwd, turn] = g;
+  const active = fwd !== 0 || turn !== 0;
+  if (active || driving) post("/api/drive", {fwd, turn});
+  driving = active;
+}, 100);
+
+// ── map interaction ──────────────────────────────────────────────────────────
+let drag = null;
+cv.addEventListener("pointerdown", e => { drag = {x: e.offsetX, y: e.offsetY, cx: view.cx, cy: view.cy, moved: false}; cv.setPointerCapture(e.pointerId); });
+cv.addEventListener("pointermove", e => {
+  if (!drag) return;
+  const dx = e.offsetX - drag.x, dy = e.offsetY - drag.y;
+  if (Math.abs(dx) + Math.abs(dy) > 5) { drag.moved = true; follow = false; $("follow").textContent = "Follow: off"; }
+  if (drag.moved) { view.cx = drag.cx - dx / view.scale; view.cy = drag.cy + dy / view.scale; }
+});
+cv.addEventListener("pointerup", e => {
+  if (drag && !drag.moved) { const [x, y] = s2w(e.offsetX, e.offsetY); post("/api/goal", {x, y}); }
+  drag = null;
+});
+cv.addEventListener("wheel", e => { e.preventDefault(); view.scale = Math.min(400, Math.max(10, view.scale * (e.deltaY < 0 ? 1.15 : 1 / 1.15))); }, {passive: false});
+$("zin").onclick = () => view.scale = Math.min(400, view.scale * 1.3);
+$("zout").onclick = () => view.scale = Math.max(10, view.scale / 1.3);
+$("zfit").onclick = () => { follow = true; $("follow").textContent = "Follow: on"; view.scale = 60; };
+$("follow").onclick = () => { follow = !follow; $("follow").textContent = "Follow: " + (follow ? "on" : "off"); };
+$("stop").onclick = () => { keys.clear(); post("/api/stop"); };
+$("save").onclick = () => post("/api/save");
+$("resume").onclick = () => post("/api/resume");
+
+resize(); pollState(); frame();
+</script>
+</body>
+</html>

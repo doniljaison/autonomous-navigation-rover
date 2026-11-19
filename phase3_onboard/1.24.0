@@ -1,0 +1,7 @@
+Defaulting to user installation because normal site-packages is not writeable
+Collecting numpy
+  Downloading numpy-2.5.5-cp313-cp313-win_amd64.whl.metadata (6.6 kB)
+Downloading numpy-2.5.5-cp313-cp313-win_amd64.whl (12.6 MB)
+   ---------------------------------------- 12.6/12.6 MB 306.2 kB/s  0:00:42
+Installing collected packages: numpy
+Successfully installed numpy-2.5.5

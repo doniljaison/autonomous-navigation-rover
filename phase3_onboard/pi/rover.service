@@ -1,0 +1,22 @@
+# Optional: start the rover stack at boot.
+#   sed "s#__USER__#$USER#g; s#__REPO__#$PWD#g" phase3_onboard/pi/rover.service | sudo tee /etc/systemd/system/rover.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now rover
+#   journalctl -u rover -f
+[Unit]
+Description=Phase 3 rover stack (SLAM + nav + web UI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=__USER__
+WorkingDirectory=__REPO__
+ExecStart=/home/__USER__/rover-venv/bin/python -m phase3_onboard.main
+# SIGINT -> main.py's handler sends L=R=0 before exiting
+KillSignal=SIGINT
+TimeoutStopSec=5
+Restart=on-failure
+RestartSec=3
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
