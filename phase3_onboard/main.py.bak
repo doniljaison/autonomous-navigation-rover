@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+"""
+On-board runtime (Raspberry Pi 4B) — Phase 3
+=============================================
+    python -m phase3_onboard.main                 # real rover: G4 on USB, ESP32 on UART
+    python -m phase3_onboard.main --sim           # full stack against the simulator
+    python -m phase3_onboard.main --map maps/x.npz --init-pose 0 0 0
+    python -m phase3_onboard.main --link http     # old WiFi link (latency comparison)
+    python -m phase3_onboard.main --headless      # no web server; SSH console + desktop GUI link (port 8765)
+        then on the PC:  python phase3_onboard/gui.py --host <pi-address>
+
+Open http://<pi-address>:8080 from the PC browser:
+    WASD / arrows / gamepad = drive (intent, re-sent at 10 Hz; Pi owns the motor stream)
+    click map = goal (A* + pure pursuit)    Space = stop    M = save map
+
+Threads
+    lidar     reads scans, logs them, keeps only the newest for SLAM
+    link-*    UART reader + single writer (motor stream, IMU poll, watchdog)
+    slam      drains IMU lines, runs SlamEngine.step(), logs per-frame stats
+    nav       manual/auto -> drive intent, proximity limiting, stuck handling
+    web       HTTP UI          sysmon   CPU / temp / throttled -> log
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import logging
+import math
+import os
+import signal
+import sys
+import threading
+import time
+from collections import deque
+from typing import Optional
+
+import numpy as np
+
+from phase3_onboard.slam.params import from_config
+
+log = logging.getLogger("main")
+
+
+class Mode:
+    MANUAL = "MANUAL"
+    AUTO = "AUTO"
+
+
+class Runtime:
+    def __init__(self, P, map_path: Optional[str] = None, init_pose=(0.0, 0.0, 0.0), tag="live",
+                 sim_params=None):
+        from phase3_onboard.lidar import LidarThread, make_lidar
+        from phase3_onboard.logger import RunLogger
+        from phase3_onboard.nav.control import PathFollower, Proximity, StuckMonitor
+        from phase3_onboard.nav.planner import Planner
+        from phase3_onboard.rover_link import RoverLink, make_transport
+        from phase3_onboard.slam.engine import SlamEngine, SlamInputs
+        from phase3_onboard.slam.grid import OccupancyGrid
+        from phase3_onboard.sysmon import SysMon
+
+        self.P = P
+        self.notes: deque = deque(maxlen=30)
+        self.live_sim = None
+        if P.LINK_TRANSPORT == "sim" or P.LIDAR_DRIVER == "sim":
+            from phase3_onboard.sim import live_instance
+            self.live_sim = live_instance(sim_params)
+        self.logger = RunLogger(P.LOG_DIR, tag, meta={"map": map_path, "init_pose": list(init_pose)}) \
+            if P.LOG_ENABLED else None
+        grid = None
+        if map_path:
+            grid = OccupancyGrid.load(map_path)
+            self.note(f"loaded map {map_path}; start pose {init_pose}")
+        self.eng = SlamEngine(P, grid=grid, init_pose=init_pose)
+        if grid is not None:
+            self.eng.relocalize_first = True
+        self.inputs = SlamInputs(P, self.eng)
+        self.link = RoverLink(make_transport(P, self.live_sim), P, self.logger)
+        self.lidar = LidarThread(make_lidar(P, self.live_sim), self.logger)
+        self.sysmon = SysMon(self.logger, P.SYSMON_HZ)
+        self.planner = Planner(P)
+        self.follower = PathFollower(P)
+        self.prox = Proximity(P)
+        self.stuck = StuckMonitor(P)
+
+        self._rxq: deque = deque(maxlen=5000)
+        self.link.subscribe(lambda t, line: self._rxq.append((t, line)))
+
+        self.lock = threading.Lock()
+        self.mode = Mode.MANUAL
+        self.goal: Optional[np.ndarray] = None
+        self.path: list = []
+        self.manual = (0.0, 0.0, 0.0)  # fwd, turn, t
+        self.last_plan_t = 0.0
+        self.lost_latched = False
+        self._sign_warned = False
+        self.nav_phase = "idle"
+        self.slam_hz = 0.0
+        self._running = False
+        self._down = False
+        self.web = None
+
+    # ── utilities ──────────────────────────────────────────────────────────────
+    def note(self, msg: str):
+        log.info(msg)
+        self.notes.append(f"{time.strftime('%H:%M:%S')} {msg}")
+        if self.logger:
+            self.logger.event("mode", msg=msg)
+
+    # ── lifecycle ──────────────────────────────────────────────────────────────
+    def start(self, web=True):
+        from phase3_onboard.slam.engine import warmup_jit
+        t0 = time.monotonic()
+        warmup_jit(self.P)
+        self.note(f"numba warm-up {time.monotonic() - t0:.1f} s")
+        self.link.start()
+        self.lidar.start()
+        self.sysmon.start()
+        self._running = True
+        threading.Thread(target=self._slam_loop, daemon=True, name="slam").start()
+        threading.Thread(target=self._nav_loop, daemon=True, name="nav").start()
+        if web:
+            from phase3_onboard.web.server import WebServer
+            self.web = WebServer(self, self.P.WEB_HOST, self.P.WEB_PORT)
+            self.web.start()
+            self.note(f"web UI on http://<this-pi>:{self.P.WEB_PORT}")
+
+    def shutdown(self, *_):
+        if self._down:
+            return
+        self._down = True
+        self._running = False
+        try:
+            self.link.stop()          # sends L=R=0 several times
+        except Exception as e:
+            log.error("link stop: %s", e)
+        try:
+            self.lidar.stop()
+        except Exception:
+            pass
+        self.sysmon.stop()
+        if self.web:
+            self.web.stop()
+        if self.live_sim:
+            self.live_sim.stop()
+        if self.logger:
+            self.logger.close()
+            log.info("log written to %s", self.logger.dir)
+
+    # ── SLAM thread ────────────────────────────────────────────────────────────
+    def _slam_loop(self):
+        last = None
+        while self._running:
+            scan = self.lidar.get(timeout=0.5)
+            while self._rxq:
+                t, line = self._rxq.popleft()
+                self.inputs.on_rx(t, line)
+            if scan is None:
+                continue
+            self.inputs.last_nonzero_cmd_t = self.link.last_nonzero_t
+            try:
+                res = self.eng.step(scan, cmd_idle=self.inputs.cmd_idle(scan.t_end), cmd=self.link.last_sent)
+            except Exception as e:
+                log.exception("SLAM step failed: %s", e)
+                self.link.stop_now("slam_error")
+                continue
+            now = time.monotonic()
+            if last is not None:
+                inst = 1.0 / max(1e-3, now - last)
+                self.slam_hz = 0.9 * self.slam_hz + 0.1 * inst if self.slam_hz else inst
+            last = now
+            if res is not None and self.logger:
+                d = res.as_log()
+                d["lat"] = round(now - scan.t_end, 4)  # scan end -> pose available
+                self.logger.event("slam", t=res.t, **d)
+
+    # ── navigation thread ─────────────────────────────────────────────────────
+    def _nav_loop(self):
+        P = self.P
+        period = 1.0 / P.NAV_HZ
+        nxt = time.monotonic()
+        while self._running:
+            try:
+                self._nav_step()
+            except Exception as e:
+                log.exception("nav error: %s", e)
+                self.link.stop_now("nav_error")
+            nxt += period
+            d = nxt - time.monotonic()
+            if d > 0:
+                time.sleep(d)
+            else:
+                nxt = time.monotonic()
+
+    def _nav_step(self):
+        P = self.P
+        snap = self.eng.snapshot()
+        pose = snap["pose"]
+        self.prox.update(snap["pts_robot"])
+        now = time.monotonic()
+
+        if snap["lost"] and not self.lost_latched:
+            self.lost_latched = True
+            self.link.stop_now("lost")
+            with self.lock:
+                if self.mode == Mode.AUTO:
+                    self.mode, self.goal, self.path = Mode.MANUAL, None, []
+            self.note("SLAM LOST: rover stopped. Drive slowly back to known area, then press 'Resume'.")
+        if not snap["lost"] and self.lost_latched:
+            self.lost_latched = False
+            self.note("SLAM re-localised (LOST cleared). Re-issue the goal if needed.")
+        if snap["gyro_sign_suspect"] >= 2 and not self._sign_warned:
+            self._sign_warned = True
+            self.note("WARNING: matches agree with MINUS the gyro — check IMU_GYRO_SIGN "
+                      "(imu_probe --handrot)")
+
+        with self.lock:
+            mode, goal = self.mode, self.goal
+            fwd_in, turn_in, t_in = self.manual
+
+        if mode == Mode.AUTO and goal is not None:
+            if snap["accepted"] < P.WARMUP_FRAMES:
+                self.nav_phase = "warmup"
+                return
+            if not self.path or now - self.last_plan_t > P.REPLAN_INTERVAL_S:
+                grid = self.eng.grid
+                path = self.planner.plan(self.eng.map_copy(), grid.res, grid.orig, pose[:2], goal)
+                self.last_plan_t = now
+                if path is None:
+                    if not self.path:
+                        self.note(f"no path to ({goal[0]:.2f}, {goal[1]:.2f}) — goal cancelled")
+                        self.cancel("no path")
+                        return
+                else:
+                    with self.lock:
+                        self.path = path
+                    self.follower.set_path(path)
+            scale = 0.5 if snap["reject_rate"] > P.SLOWDOWN_REJECT_RATE else 1.0
+            L, R, phase = self.follower.compute(pose, scale)
+            self.nav_phase = phase
+            if phase == "arrived":
+                self.link.stop_now("arrived")
+                self.note(f"goal reached ({pose[0]:.2f}, {pose[1]:.2f}); "
+                          f"err {math.hypot(goal[0]-pose[0], goal[1]-pose[1]):.2f} m")
+                with self.lock:
+                    self.mode, self.goal, self.path = Mode.MANUAL, None, []
+                return
+            st = self.stuck.check(pose, commanding_motion=abs(L) + abs(R) > 0.05)
+            if st == "give_up":
+                self.note("stuck: giving up on goal")
+                self.cancel("stuck")
+                return
+            if st == "backup":
+                L = R = -0.18
+                self.nav_phase = "backup"
+                self.last_plan_t = 0.0
+            L, R, blocked = self.prox.limit(L, R)
+            if blocked:
+                self.nav_phase = "blocked"
+                self.last_plan_t = min(self.last_plan_t, now - P.REPLAN_INTERVAL_S + 0.5)
+            self.link.set_intent(L, R, "auto", ttl=0.5)
+        else:
+            self.nav_phase = "manual"
+            # the link TTL is what is LEFT of the browser's intent, so a dead
+            # browser stops the rover INTENT_TTL_S after its last message
+            remaining = P.INTENT_TTL_S - (now - t_in)
+            if remaining > 0 and abs(fwd_in) <= 1e-3 and abs(turn_in) <= 1e-3:
+                self.link.set_intent(0.0, 0.0, "manual", ttl=remaining)   # explicit stop
+            elif remaining > 0:
+                from phase3_onboard.nav.control import mix
+                scale = 0.5 if snap["lost"] else 1.0
+                L, R = mix(fwd_in * P.MANUAL_MAX_DUTY * scale, turn_in * P.MANUAL_TURN_DUTY,
+                           P.MANUAL_MAX_DUTY)
+                if P.PROX_APPLIES_TO_MANUAL:
+                    L, R, blocked = self.prox.limit(L, R)
+                    if blocked:
+                        self.nav_phase = "manual_blocked"
+                self.link.set_intent(L, R, "manual", ttl=remaining)
+
+    # ── commands (web thread) ────────────────────────────────────────────────
+    def drive(self, fwd: float, turn: float):
+        fwd = max(-1.0, min(1.0, float(fwd)))
+        turn = max(-1.0, min(1.0, float(turn)))
+        with self.lock:
+            if self.mode == Mode.AUTO and (abs(fwd) > 0.05 or abs(turn) > 0.05):
+                self.mode, self.goal, self.path = Mode.MANUAL, None, []
+                self.notes.append("manual override: goal cancelled")
+            self.manual = (fwd, turn, time.monotonic())
+
+    def set_goal(self, x: float, y: float):
+        if self.eng.lost:
+            self.note("goal refused: SLAM is LOST (press Resume first)")
+            return False
+        with self.lock:
+            self.goal = np.array([float(x), float(y)])
+            self.path = []
+            self.mode = Mode.AUTO
+            self.manual = (0.0, 0.0, 0.0)
+        self.last_plan_t = 0.0
+        self.stuck.reset(self.eng.pose)
+        self.note(f"goal ({x:.2f}, {y:.2f})")
+        return True
+
+    def cancel(self, why="cancel"):
+        with self.lock:
+            self.mode, self.goal, self.path = Mode.MANUAL, None, []
+            self.manual = (0.0, 0.0, 0.0)
+        self.follower.set_path([])
+        self.link.stop_now(why)
+
+    def stop(self):
+        self.cancel("stop")
+        self.note("STOP")
+
+    def clear_lost(self):
+        self.eng.clear_lost()
+        self.lost_latched = False
+        self.note("LOST cleared by operator")
+
+    def save_map(self) -> str:
+        os.makedirs(self.P.MAPS_DIR, exist_ok=True)
+        path = os.path.join(self.P.MAPS_DIR, f"map_{time.strftime('%Y%m%d_%H%M%S')}.npz")
+        with self.eng.lock:
+            self.eng.grid.save(path, pose=self.eng.pose)
+        self.note(f"map saved: {path}")
+        return path
+
+    # ── state for the UI ───────────────────────────────────────────────────────
+    def state(self) -> dict:
+        snap = self.eng.snapshot()
+        with self.lock:
+            mode, goal, path = self.mode, self.goal, list(self.path)
+        with self.eng.lock:
+            trail = list(self.eng.path)[-900::3]
+        g = self.eng.grid
+        d = {
+            "t": time.monotonic(),
+            "mode": mode, "phase": self.nav_phase,
+            "goal": None if goal is None else [round(float(goal[0]), 3), round(float(goal[1]), 3)],
+            "path": [[round(float(p[0]), 3), round(float(p[1]), 3)] for p in path],
+            "pose": [round(float(v), 4) for v in snap["pose"]],
+            "lost": snap["lost"],
+            "slam": {k: snap[k] for k in ("frames", "accepted", "rejected", "skipped")} |
+                    {"reject_rate": round(snap["reject_rate"], 3), "hz": round(self.slam_hz, 1),
+                     "last": snap["last"], "gyro_ready": snap["gyro_ready"],
+                     "gyro_bias_dps": round(math.degrees(snap["gyro_bias"]), 3),
+                     "gyro_scale_corr": round(snap["gyro_scale_corr"], 3)},
+            "trail": [[round(p[1], 3), round(p[2], 3)] for p in trail],
+            "scan": np.round(snap["scan_world"], 3).tolist(),
+            "prox": self.prox.as_dict(),
+            "link": self.link.status(),
+            "lidar": {"rate_hz": round(self.lidar.rate_hz, 2), "points": self.lidar.last_n,
+                      "scans": self.lidar.count, "dropped": self.lidar.dropped, "error": self.lidar.error},
+            "sys": self.sysmon.state,
+            "map": {"res": g.res, "orig": g.orig, "n": g.n, "version": snap["map_version"]},
+            "notes": list(self.notes)[-8:],
+            "log_dir": self.logger.dir if self.logger else None,
+        }
+        if self.live_sim is not None:
+            # truth in the map frame (= robot frame at start); only valid without --map
+            from phase3_onboard.common import relative
+            rel = relative(np.array(self.live_sim.core.p.start_pose), self.live_sim.truth_pose)
+            d["sim_truth"] = [round(float(v), 4) for v in rel]
+        return d
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--sim", action="store_true", help="run against the simulator")
+    ap.add_argument("--link", choices=["uart", "http", "sim"], default=None)
+    ap.add_argument("--lidar", choices=["ydlidar", "pylidar3", "sim"], default=None)
+    ap.add_argument("--map", default=None, help="load a saved map (.npz)")
+    ap.add_argument("--init-pose", nargs=3, type=float, default=(0.0, 0.0, 0.0),
+                    metavar=("X", "Y", "TH_DEG"), help="start pose in the loaded map (theta in degrees)")
+    ap.add_argument("--port", type=int, default=None, help="web UI port")
+    ap.add_argument("--tag", default=None, help="log directory tag")
+    ap.add_argument("--no-log", action="store_true")
+    ap.add_argument("--headless", action="store_true",
+                    help="no web server; SSH console (goal X Y, stop, save, status, spin, fwd) + GUI link")
+    ap.add_argument("--gui-port", type=int, default=8765, help="TCP port for phase3_onboard/gui.py (headless)")
+    ap.add_argument("--no-gui-server", action="store_true", help="headless without the GUI link")
+    ap.add_argument("--set", action="append", dest="sets", help="NAME=VALUE config override")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    a = ap.parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
+                        format="[%(levelname)s %(asctime)s %(name)s] %(message)s", datefmt="%H:%M:%S")
+    from phase3_onboard.tools.replay import _parse_sets
+    ov = _parse_sets(a.sets)
+    if a.sim:
+        ov.setdefault("LINK_TRANSPORT", "sim")
+        ov.setdefault("LIDAR_DRIVER", "sim")
+    if a.link:
+        ov["LINK_TRANSPORT"] = a.link
+    if a.lidar:
+        ov["LIDAR_DRIVER"] = a.lidar
+    if a.port:
+        ov["WEB_PORT"] = a.port
+    if a.no_log:
+        ov["LOG_ENABLED"] = False
+    P = from_config(**ov)
+    init = (a.init_pose[0], a.init_pose[1], math.radians(a.init_pose[2]))
+    rt = Runtime(P, a.map, init, tag=a.tag or ("sim" if a.sim else "live"))
+
+    def _sig(signum, _frame):
+        log.info("signal %d -> shutdown", signum)
+        rt.shutdown()
+        sys.exit(0)
+    signal.signal(signal.SIGINT, _sig)
+    signal.signal(signal.SIGTERM, _sig)
+    if a.headless:
+        signal.signal(signal.SIGHUP, _sig)   # SSH session dropped -> stop the rover
+    atexit.register(rt.shutdown)
+    try:
+        rt.start(web=not a.headless)
+    except Exception as e:
+        log.error("startup failed: %s", e)
+        rt.shutdown()
+        sys.exit(1)
+    if a.headless:
+        gui = None
+        if not a.no_gui_server:
+            from phase3_onboard.gui_server import GuiServer
+            gui = GuiServer(rt, "0.0.0.0", a.gui_port)
+            gui.start()
+        try:
+            if sys.stdin.isatty():
+                from phase3_onboard.headless import console
+                console(rt)
+            else:   # no terminal (e.g. started by systemd): GUI only; signals still stop the rover
+                while True:
+                    time.sleep(1.0)
+        finally:
+            if gui:
+                gui.stop()
+            rt.shutdown()
+        return
+    while True:
+        time.sleep(1.0)
+
+
+if __name__ == "__main__":
+    main()
+

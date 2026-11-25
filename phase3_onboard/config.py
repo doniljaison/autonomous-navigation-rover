@@ -41,7 +41,7 @@ ECHO_OFF          = True           # send {"T":143,"cmd":0}
 IMU_POLL_HZ       = 25.0           # poll {"T":126} at this rate (0 = rely on feedback stream only)
 MAX_DUTY          = 0.50           # firmware limit (0.5 == 100 % PWM)
 SWAP_LR           = False          # set True if L/R wires turn out swapped
-INVERT_FWD        = False          # set True if positive duty drives the rover backwards
+INVERT_FWD        = True          # set True if positive duty drives the rover backwards
 
 # IMU field mapping. CAPTURE RAW OUTPUT FIRST (tools/imu_probe.py) and fix these.
 # Firmware replies to T:126 with T:1002 ({"r","p","y","ax".."gz","mx".."mz","temp"}).
@@ -159,15 +159,15 @@ GOAL_TOLERANCE_M   = 0.12
 LOOKAHEAD_M        = 0.40
 REPLAN_INTERVAL_S  = 2.0
 AUTO_FWD_DUTY      = 0.22          # straight-line duty in AUTO
-AUTO_TURN_DUTY_MAX = 0.20          # caps auto spin rate so the matcher keeps up
-AUTO_TURN_DUTY_MIN = 0.12          # skid-steer needs this much to turn in place at all
+AUTO_TURN_DUTY_MAX = 0.45          # caps auto spin rate so the matcher keeps up
+AUTO_TURN_DUTY_MIN = 0.35          # skid-steer needs this much to turn in place at all
 AUTO_TURN_GAIN     = 0.30          # duty per rad of heading error
 ROTATE_FIRST_DEG   = 50.0          # rotate in place if heading error bigger than this
 SLOWDOWN_REJECT_RATE = 0.3         # recent gate-reject fraction above which speed is halved
 WARMUP_FRAMES      = 10
 
 MANUAL_MAX_DUTY    = 0.40
-MANUAL_TURN_DUTY   = 0.30
+MANUAL_TURN_DUTY   = 0.45
 
 PROX_SECTOR_HALF_DEG = 30.0
 PROX_STOP_M        = 0.25          # forward motion blocked below this (front sector, from rover centre)

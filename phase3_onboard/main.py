@@ -6,6 +6,8 @@ On-board runtime (Raspberry Pi 4B) — Phase 3
     python -m phase3_onboard.main --sim           # full stack against the simulator
     python -m phase3_onboard.main --map maps/x.npz --init-pose 0 0 0
     python -m phase3_onboard.main --link http     # old WiFi link (latency comparison)
+    python -m phase3_onboard.main --headless      # no web server; SSH console + desktop GUI link (port 8765)
+        then on the PC:  python phase3_onboard/gui.py --host <pi-address>
 
 Open http://<pi-address>:8080 from the PC browser:
     WASD / arrows / gamepad = drive (intent, re-sent at 10 Hz; Pi owns the motor stream)
@@ -74,7 +76,11 @@ class Runtime:
             self.eng.relocalize_first = True
         self.inputs = SlamInputs(P, self.eng)
         self.link = RoverLink(make_transport(P, self.live_sim), P, self.logger)
-        self.lidar = LidarThread(make_lidar(P, self.live_sim), self.logger)
+        if self.live_sim is None and getattr(P, "LIDAR_IN_PROCESS", True):
+            from phase3_onboard.lidar_proc import LidarProcess
+            self.lidar = LidarProcess(P, self.logger)   # SDK holds the GIL: keep it out of this process
+        else:
+            self.lidar = LidarThread(make_lidar(P, self.live_sim), self.logger)
         self.sysmon = SysMon(self.logger, P.SYSMON_HZ)
         self.planner = Planner(P)
         self.follower = PathFollower(P)
@@ -373,6 +379,10 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=None, help="web UI port")
     ap.add_argument("--tag", default=None, help="log directory tag")
     ap.add_argument("--no-log", action="store_true")
+    ap.add_argument("--headless", action="store_true",
+                    help="no web server; SSH console (goal X Y, stop, save, status, spin, fwd) + GUI link")
+    ap.add_argument("--gui-port", type=int, default=8765, help="TCP port for phase3_onboard/gui.py (headless)")
+    ap.add_argument("--no-gui-server", action="store_true", help="headless without the GUI link")
     ap.add_argument("--set", action="append", dest="sets", help="NAME=VALUE config override")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
@@ -401,13 +411,33 @@ def main(argv=None):
         sys.exit(0)
     signal.signal(signal.SIGINT, _sig)
     signal.signal(signal.SIGTERM, _sig)
+    if a.headless:
+        signal.signal(signal.SIGHUP, _sig)   # SSH session dropped -> stop the rover
     atexit.register(rt.shutdown)
     try:
-        rt.start()
+        rt.start(web=not a.headless)
     except Exception as e:
         log.error("startup failed: %s", e)
         rt.shutdown()
         sys.exit(1)
+    if a.headless:
+        gui = None
+        if not a.no_gui_server:
+            from phase3_onboard.gui_server import GuiServer
+            gui = GuiServer(rt, "0.0.0.0", a.gui_port)
+            gui.start()
+        try:
+            if sys.stdin.isatty():
+                from phase3_onboard.headless import console
+                console(rt)
+            else:   # no terminal (e.g. started by systemd): GUI only; signals still stop the rover
+                while True:
+                    time.sleep(1.0)
+        finally:
+            if gui:
+                gui.stop()
+            rt.shutdown()
+        return
     while True:
         time.sleep(1.0)
 
